@@ -52,7 +52,7 @@ import           Data.Time                            (UTCTime)
 data Direction = Backwards | Forwards
   deriving (Eq, Show, Read, Ord)
 
--- | Case analisys for 'Direction'. Evaluate to the first @a@ in case it is
+-- | Case analysis for 'Direction'. Evaluate to the first @a@ in case it is
 -- 'Backwards', otherwise to the second @a@.
 direction :: a -> a -> Direction -> a
 direction a _ Backwards = a
@@ -163,7 +163,7 @@ data Step env = forall x y. Step
 data Scenario a = Desired | Recovery !a
   deriving (Eq, Ord, Show)
 
--- | Case analisys for 'Scenario'.
+-- | Case analysis for 'Scenario'.
 scenario :: b -> (a -> b) -> Scenario a -> b
 scenario b _ Desired      = b
 scenario _ f (Recovery a) = f a
