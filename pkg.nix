@@ -1,5 +1,5 @@
 { mkDerivation, base, blaze-builder, postgresql-simple, stdenv
-, text, time, transformers
+, tasty, tasty-hunit, text, time, transformers
 }:
 mkDerivation {
   pname = "umzug";
@@ -8,6 +8,7 @@ mkDerivation {
   libraryHaskellDepends = [
     base blaze-builder postgresql-simple text time transformers
   ];
+  testHaskellDepends = [ base tasty tasty-hunit text time ];
   description = "Bidirectional migrations in your persistence backend of choice";
   license = stdenv.lib.licenses.bsd3;
 }

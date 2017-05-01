@@ -1,12 +1,14 @@
-{-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE RankNTypes                 #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Data.Umzug.Core
  ( -- * Running migrations
-   runMigrations
+   run
 
    -- * Writing migrations
  , migMany
@@ -15,11 +17,11 @@ module Data.Umzug.Core
    -- * Keeping track of ran migrations
 
  , MigsDb(..)
- , assertSaneMigrations
+ , migsdbIds
 
    -- * Types
 
- , MigId
+ , MigId(..)
 
  , Mig(..)
  , migIds
@@ -31,18 +33,24 @@ module Data.Umzug.Core
  , Migrate(..)
 
  , Step(..)
+ , naiveStep
  , StepRunner
 
- , Scenario(..)
- , scenario
+ , Target
+ , targetForwards
+ , targetBackwards
+ , targetMigration
+
+ , Err_Locked(..)
  ) where
 
+import           Control.Concurrent                   (threadDelay)
 import qualified Control.Exception                    as Ex
 import           Control.Monad
-import           Control.Monad.Trans.Reader           (ReaderT(runReaderT))
 import           Data.Foldable
 import qualified Data.List as List
 import           Data.Monoid
+import           Data.String                          (IsString)
 import           Data.Text                            (Text)
 import qualified Data.Text                            as T
 import           Data.Time                            (UTCTime)
@@ -65,7 +73,11 @@ directionOpposite = direction Forwards Backwards
 
 -- | Unique identifier for a 'Mig' (unique within the closed word of 'Mig's you
 -- want to deal with, that is).
-type MigId = Text
+newtype MigId = MigId Text
+  deriving (Eq, Ord, IsString)
+
+instance Show MigId where
+  show (MigId x) = show x
 
 --------------------------------------------------------------------------------
 
@@ -98,8 +110,7 @@ migMany
                   --   forward direction (even if you plan to apply your
                   --   migrations backwards).
   -> Mig a env
-migMany num desc migs = Mig num desc $ MigrateMany migs
-
+migMany num desc migs = Mig num desc (MigrateMany migs)
 
 -- | Create a new 'Mig' that performs a single migration step, either in
 -- forwards or backwards direction as later desired.
@@ -107,23 +118,10 @@ mig
   :: MigId  -- ^ Unique identifier.
   -> Text   -- ^ Migration description.
   -> a      -- ^ Description of the migration.
-  -> (Scenario y -> ReaderT env IO x)
-            -- ^ Side-effecting action to perform when going forwards. Getting
-            --   a @Recovery y@ constructor as second argument means this action
-            --   is being executed as a recovery mechanism because one of the
-            --   following migrations failed. Whatever this function returns
-            --   is made available to the backwards step in case recovery in
-            --   that direction is needed.
-  -> (Scenario x -> ReaderT env IO y)
-            -- ^ Side-effecting action to perform when going backwards. Getting
-            --   a @Recovery x@ constructor as second argument means this action
-            --   is being executed as a recovery mechanism because one of the
-            --   following migrations failed. Whatever this function returns
-            --   is made available to the forwards step in case recovery in
-            --   that direction is needed.
+  -> Step 'Forwards env
+  -> Maybe (Step 'Backwards env)
   -> Mig a env
-mig num desc a fw bw = Mig num desc $
-    MigrateOne a Step{stepForwards=fw, stepBackwards=bw}
+mig num desc a stepf ystepb = Mig num desc (MigrateOne a stepf ystepb)
 
 --------------------------------------------------------------------------------
 
@@ -133,54 +131,74 @@ data Migrate a env
     -- successes if one of the following migrations fails.
     MigrateMany ![Mig a env]
   | -- | Apply a custom migration step as described by @a@.
-    MigrateOne !a !(Step env)
+    MigrateOne !a !(Step 'Forwards env) !(Maybe (Step 'Backwards env))
 
 --------------------------------------------------------------------------------
 
--- | A single real-world side-effecting step in a migration.
---
--- TODO: Make the @x@ and @y@ below be 'Binary' instances or something,
--- so that we can persist this state somewhere for resilience.
-data Step env = forall x y. Step
-  { stepForwards  :: !(Scenario y -> ReaderT env IO x)
-    -- ^ Side-effecting action to perform when going forwards. Getting
-    --   a @Recovery y@ constructor as second argument means this action
-    --   is being executed as a recovery mechanism because one of the
-    --   following migrations failed. Whatever this function returns
-    --   is made available to the backwards step in case recovery in
-    --   that direction is needed.
-  , stepBackwards :: !(Scenario x -> ReaderT env IO y)
-    -- ^ Side-effecting action to perform when going backwards. Getting
-    --   a @Recovery x@ constructor as second argument means this action
-    --   is being executed as a recovery mechanism because one of the
-    --   following migrations failed. Whatever this function returns
-    --   is made available to the forwards step in case recovery in
-    --   that direction is needed.
+-- | A single real-world side-effecting step in a migration with direction @d@.
+data Step (d :: Direction) env = forall pre pos. Step
+  { step :: env -> IO (pre, IO pos)
+    -- ^ Migrate in direction @d@.
+    --
+    -- If @'IO' pos@ fails, then 'stepRecover' will be called.
+    --
+    -- If @'IO' pos@ succeeds, but a latter migration intended to be executed
+    -- atomically with this fails, then 'stepRollback' will be called.
+  , stepRecover :: env -> pre -> IO ()
+    -- ^ See 'step'
+  , stepRollback :: env -> pre -> pos -> IO ()
   }
 
---------------------------------------------------------------------------------
-
-data Scenario a = Desired | Recovery !a
-  deriving (Eq, Ord, Show)
-
--- | Case analysis for 'Scenario'.
-scenario :: b -> (a -> b) -> Scenario a -> b
-scenario b _ Desired      = b
-scenario _ f (Recovery a) = f a
+-- | A 'Step' that doesn't do any recovery nor rollback.
+naiveStep
+  :: (env -> IO ())   -- ^ Migrate in direction @d@.
+  -> Step d env
+naiveStep f = Step
+  (\env -> pure ((), f env)) (\_ _ -> pure ()) (\_ _ _ -> pure ())
 
 --------------------------------------------------------------------------------
 
 type StepRunner a env = forall x. a -> (env -> IO x) -> IO x
 
 --------------------------------------------------------------------------------
--- Logging
 
 data MigsDb = MigsDb
   { migsdbAdd :: MigId -> T.Text -> IO ()
+    -- ^ Atomic.
   , migsdbDel :: MigId -> IO ()
+    -- ^ Atomic.
   , migsdbGet :: MigId -> IO (Maybe (T.Text, UTCTime))
+    -- ^ Atomic.
   , migsdbAll :: IO [(MigId, T.Text, UTCTime)]
+    -- ^ Atomic. All migrations, ordered chronologically by timestamp.
+  , migsdbLock :: IO ()
+    -- ^ Atomic.
+  , migsdbUnlock :: IO ()
+    -- ^ Atomic.
   }
+
+withMigsDbLock :: MigsDb -> IO a -> IO a
+withMigsDbLock mdb =
+    Ex.bracket_ lock (migsdbUnlock mdb)
+  where
+    lock = Ex.catch (migsdbLock mdb) $ \Err_Locked -> do
+      putStrLn ("Umzug database is currently locked. Retrying in 10 seconds.")
+      threadDelay (1000000 * 10)
+      lock
+
+migsdbIds :: MigsDb -> IO [MigId]
+migsdbIds = fmap (map (\(x,_,_) -> x)) . migsdbAll
+
+--------------------------------------------------------------------------------
+
+-- | A simple wrapper around @'IO' ()@, mostly for avoid accidentally confusing
+-- this 'IO' action with others.
+newtype Undo = Undo { runUndo :: IO () }
+
+instance Monoid Undo where
+  mempty = Undo (pure ())
+  -- | @'mappend' a b@ runs @a@ first, then @b@.
+  mappend (Undo a) (Undo b) = Undo (a >> b)
 
 withLoggedMigration
   :: MigsDb            -- ^ Where to log the migration.
@@ -188,12 +206,12 @@ withLoggedMigration
   -> Direction         -- ^ Direction on which the migration is being applied
   -> MigId             -- ^ Identifier for the migration being applied
   -> T.Text            -- ^ Description of the migration being applied
-  -> IO (IO ())        -- ^ Action that performs the migration in the desired
+  -> IO Undo           -- ^ Action that performs the migration in the       desired
                        --   direction and returns a rollback action in the
                        --   opposite direction, which will be used in case it is
                        --   not possible to sucessfully record the migration
                        --   execution.
-  -> IO (IO ())        -- ^ Same as the last argument, except it records the
+  -> IO Undo           -- ^ Same as the last argument, except it records the
                        --   migration execution when going in the desired
                        --   direction and removes it from the records when going
                        --   in the opposite direction.
@@ -204,95 +222,179 @@ withLoggedMigration migsdb say0 d0 migId' migDesc' m = do
       (Forwards,  Just _)  -> skip
       _ -> do
          say d0 "START"
-         undo <- m `Ex.catch` \(e :: Ex.SomeException) -> do
-            say d0 $ "ERROR: " <> show e
+         undo <- Ex.catch m $ \(e :: Ex.SomeException) -> do
+            say d0 ("ERROR: " <> show e)
             Ex.throwIO e
          say d0 "SUCCESS"
-
-         -- say d0 "LOG START"
-         logMig d0 `Ex.catch` \(e ::Ex.SomeException) -> do
-            say d0 $ "LOG ERROR: " <> show e
-            undo
+         Ex.catch (logMig d0) $ \(e ::Ex.SomeException) -> do
+            say d0 ("LOG ERROR: " <> show e)
+            runUndo undo
             Ex.throwIO e
-         -- say d0 $ "LOG SUCCESS"
-
-         return $ do
-            undo
+         pure $ Undo $ do
+            runUndo undo
             let d' = directionOpposite d0
-            -- say d' "LOG START"
-            logMig d' `Ex.catch` \(e :: Ex.SomeException) -> do
-               say d' $ "LOG ERROR: " <> show e
+            Ex.catch (logMig d') $ \(e :: Ex.SomeException) -> do
+               say d' ("LOG ERROR: " <> show e)
                Ex.throwIO e
-            -- say d' "LOG SUCCESS "
  where
     say :: Direction -> String -> IO ()
     say d x = do
       let prefix = direction "<- BCK " "-> FWD " d
-      say0 $ prefix <> show migId' <> " - " <> x
+      say0 (prefix <> show migId' <> " - " <> x)
 
-    skip :: IO (IO ())
-    skip = return () <$ say d0 "SKIPPING: already done"
+    skip :: IO Undo
+    skip = say d0 "SKIPPING: already done" >> pure mempty
 
     logMig :: Direction -> IO ()
     logMig Backwards = migsdbDel migsdb migId'
     logMig Forwards  = migsdbAdd migsdb migId' migDesc'
 
 --------------------------------------------------------------------------------
+
+data Target a env = UnsafeTarget [Mig a env] MigId
+
+targetForwards :: [Mig a env] -> Maybe (Target a env)
+targetForwards [] = Nothing
+targetForwards xs = Just (UnsafeTarget xs (migId (last xs)))
+
+targetBackwards :: [Mig a env] -> Maybe (Target a env)
+targetBackwards [] = Nothing
+targetBackwards xs = Just (UnsafeTarget xs (migId (head xs)))
+
+-- | Note: It is impossible to target a child migration inside a 'MigrateMany'
+-- (such as the childs passed to 'migMany').
+targetMigration :: MigId -> [Mig a env] -> Maybe (Target a env)
+targetMigration mId xs =
+  fmap (UnsafeTarget xs . migId) (List.find ((==) mId . migId) xs)
+
+--------------------------------------------------------------------------------
 -- Running migrations
 
-runMigrations
+run
   :: MigsDb            -- ^ Where to keep track of applied migrations.
   -> (String -> IO ()) -- ^ Used to report textual progress.
+  -> Target a env      -- ^ Target migration.
   -> StepRunner a env  -- ^ How to run each migration step.
-  -> Direction         -- ^ Direction in which to apply the migrations.
-  -> [Mig a env]       -- ^ Migrations available, listed in forward order (even
-                       --   if you are running migrations backwards).
   -> IO ()
-runMigrations migsdb say runner d0 migs = do
-    assertSaneMigrations migsdb migs
-    void $ sequence $
-       run' migsdb say runner d0 `map` direction reverse id d0 migs
+run migsdb say t runner = do
+  withMigsDbLock migsdb $ do
+     yp <- mkPlan migsdb t
+     case yp of
+        Nothing -> say "Nothing to do. Bye."
+        Just (UnsafePlan d0 migs) -> do
+           traverse_ (run' migsdb say runner d0) migs
 
-
+-- | Internal
 run' :: MigsDb
      -> (String -> IO ())
      -> StepRunner a env
      -> Direction
      -> Mig a env
-     -> IO (IO ())
+     -> IO Undo
 run' migsdb say runner d0 (Mig migId' migDesc migMigIns) = do
     let withLoggedMigration' = withLoggedMigration migsdb say
     withLoggedMigration' d0 migId' migDesc $ case migMigIns of
-       MigrateMany migs -> do
-          let step undo x = do
-                undo' <- run' migsdb say runner d0 x `Ex.onException` undo
-                return $ undo' >> undo
-          foldlM step (return ()) $ direction reverse id d0 migs
-       MigrateOne migTy Step{stepForwards=fw, stepBackwards=bw} -> case d0 of
-          Backwards -> do
-             res <- runner migTy $ runReaderT (bw Desired)
-             return $ join $ withLoggedMigration' Forwards migId' migDesc $ do
-                _ <- runner migTy $ runReaderT (fw (Recovery res))
-                return (return ())
+       MigrateMany migs -> foldlM
+          (\undo x -> do
+              undo' <- Ex.onException
+                 (run' migsdb say runner d0 x)
+                 (runUndo undo)
+              pure (undo' <> undo))
+          (mempty :: Undo)
+          (direction reverse id d0 migs)
+       MigrateOne a (Step f frec frol) ystepb -> case d0 of
           Forwards -> do
-             res <- runner migTy $ runReaderT (fw Desired)
-             return $ join $ withLoggedMigration' Backwards migId' migDesc $ do
-                _ <- runner migTy $ runReaderT (bw (Recovery res))
-                return (return ())
+             (pre, mpos) <- runner a f
+             let bwd = \ypos -> join $ fmap runUndo $ do
+                    withLoggedMigration' Backwards migId' migDesc $ do
+                       runner a $ \env -> case ypos of
+                          Nothing  -> frec env pre
+                          Just pos -> frol env pre pos
+                       pure mempty
+             pos <- Ex.onException mpos (bwd Nothing)
+             pure (Undo (bwd (Just pos)))
+          Backwards -> case ystepb of
+             Nothing -> Ex.throwIO (Err_UnsuportedMigBackwards migId')
+             Just (Step b brec brol) -> do
+                (pre, mpos) <- runner a b
+                let fwd = \ypos -> join $ fmap runUndo $ do
+                       withLoggedMigration' Forwards migId' migDesc $ do
+                          runner a $ \env -> case ypos of
+                             Nothing  -> brec env pre
+                             Just pos -> brol env pre pos
+                          pure mempty
+                pos <- Ex.onException mpos (fwd Nothing)
+                pure (Undo (fwd (Just pos)))
 
+--------------------------------------------------------------------------------
 
+data Plan a env = UnsafePlan Direction [Mig a env]
+  -- ^ Migrations to be run listed in the order in which they need to be
+  --   run according to 'Direction'.
 
-assertSaneMigrations :: MigsDb -> [Mig a env] -> IO ()
-assertSaneMigrations _ml migs = do
-   unless (null repMigs) $
-      error $ "Duplicate migration identifiers: " <> show repMigs
-   -- TODO: more sanity checks
-  where
-    fwMigIds = migs >>= migIds
-    repMigs = repeatedElements fwMigIds
+mkPlan
+  :: MigsDb
+  -> Target a env
+  -> IO (Maybe (Plan a env))
+mkPlan migsdb (UnsafeTarget migs mId) = do
+  let mIds = migs >>= migIds
+
+  -- check for duplicates
+  let repMigs = repeatedElements mIds
+  unless (null repMigs) $ do
+     error ("Duplicate migration identifiers: " <> show repMigs)
+
+  -- check for incompatible migs list
+  mIdsInDb <- migsdbIds migsdb
+  unless (List.isPrefixOf mIdsInDb mIds) $ do
+     error ("The desired migrations list (" <> show mIds <> ") is not \
+            \compatible with already ran migrations (" <> show mIdsInDb <> ")")
+
+  -- figure out the plan
+  pure $ case lastMay mIdsInDb of
+     Just mIdCurrent
+       | mId == mIdCurrent -> Nothing
+       | elem mId (init mIdsInDb) ->
+          Just $ UnsafePlan Backwards $ reverse $
+             dropUntilAfter ((==) mId . migId)
+                (dropAfter ((==) mIdCurrent . migId) migs)
+     _ -> Just $ UnsafePlan Forwards (dropAfter ((==) mId . migId) migs)
+
+--------------------------------------------------------------------------------
+
+data Err_Locked = Err_Locked
+  deriving (Eq, Ord, Show)
+instance Ex.Exception Err_Locked
+
+data Err_UnsuportedMigBackwards = Err_UnsuportedMigBackwards !MigId
+  deriving (Eq, Ord, Show)
+instance Ex.Exception Err_UnsuportedMigBackwards
 
 --------------------------------------------------------------------------------
 
 -- | Returns the elements in a list that are repeated
 repeatedElements :: Ord a => [a] -> [a]
 repeatedElements = mconcat . filter ((>1) . length) . List.group . List.sort
+
+-- | Returns the last element in the given list, unless the list if empty.
+lastMay :: [a] -> Maybe a
+lastMay [] = Nothing
+lastMay xs = Just (last xs)
+
+-- | @'dropAfter' (== 6) [5,6,7,8]   =   [5,6]@
+--
+-- @'dropAfter' f xs ++ 'dropUntilAfter' f xs   =   'id'@
+dropAfter :: (a -> Bool) -> [a] -> [a]
+dropAfter f = go
+  where go [] = []
+        go (a:as) | f a = [a]
+                  | otherwise = a : go as
+
+-- | @'dropUntilAfter' (== 6) [5,6,7,8]   =   [7,8]@
+--
+-- @'dropAfter' f xs ++ 'dropUntilAfter' f xs   =   'id'@
+dropUntilAfter :: (a -> Bool) -> [a] -> [a]
+dropUntilAfter f = go
+  where go [] = []
+        go (a:as) | f a = as
+                  | otherwise = go as
