@@ -1,7 +1,8 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -36,6 +37,15 @@ module Data.Umzug.Core
  , naiveStep
  , StepRunner
 
+ , Recon(..)
+ , Alter(..)
+
+ , Codec(..)
+ , aesonCodec
+
+ , RecoveryDataId(..)
+ , RecoveryDataStore(..)
+
  , Target
  , targetForwards
  , targetBackwards
@@ -44,16 +54,23 @@ module Data.Umzug.Core
  , Err_Locked(..)
  ) where
 
-import           Control.Concurrent                   (threadDelay)
-import qualified Control.Exception                    as Ex
-import           Control.Monad
-import           Data.Foldable
+import Control.Concurrent (threadDelay)
+import qualified Control.Exception as Ex
+import Control.Monad
+import Control.Monad.Trans.State.Strict (evalStateT)
+import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
+import Data.Foldable
+import Data.Int (Int64)
 import qualified Data.List as List
-import           Data.Monoid
-import           Data.String                          (IsString)
-import           Data.Text                            (Text)
-import qualified Data.Text                            as T
-import           Data.Time                            (UTCTime)
+import Data.Monoid
+import Data.String (IsString)
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Time (UTCTime)
+import qualified Pipes
+import qualified Pipes.Parse as Pipes
+import qualified Pipes.Aeson.Unchecked
 
 --------------------------------------------------------------------------------
 
@@ -135,18 +152,112 @@ data Migrate a env
 
 --------------------------------------------------------------------------------
 
+-- | Wrapper around an 'IO' action intended to do any preliminary reconnaissance
+-- work before running any mutating work through 'Alter', gathering enough
+-- information about the data that 'Alter' will modify so that said data can be
+-- recovered if necessary.
+--
+-- 'Recon' must not perform any mutating or destructive side-effect.
+--
+-- For example, if the related 'Alter' plans to delete entries from a database,
+-- then 'Recon' should gather the entries to be deleted in @pre@, so that they
+-- can be inserted back if necessary, as part of a recovery or rollback process.
+newtype Recon pre pos = Recon { runRecon  :: IO (pre, Alter pos) }
+
+-- | Wraper around an 'IO' action intended to do any altering or destructive
+-- side-effect as part of a 'Step'.
+--
+-- The @pos@ value, used in combination with the @pre@ value provided by the
+-- @'Recon' pre pos@ where this @'Alter' pos@ was obtained, should provide
+-- enough information to allow for the rollback of the side-effects performed by
+-- this 'Alter', in case an automated rollback is necessary as part of some
+-- recovery process.
+newtype Alter pos = Alter { runAlter :: IO pos }
+
+-- | Witness that @a@ can be encoded and decoded as a 'BS.ByteString'.
+--
+-- @em@ is the base 'Monad' used for encoding.
+--
+-- @dm@ is the base 'Monad' used for decoding.
+--
+-- @
+-- 'decode' ('encode' a) == 'pure' ('Just' a)
+-- @
+data Codec em dm a = Codec
+  { encode :: a -> Pipes.Producer BS.ByteString em ()
+  , decode :: Pipes.Parser BS.ByteString dm (Maybe a)
+  }
+
+-- | Serializes @x@ using its 'Aeson.ToJSON'/'Aeson.FromJSON' representation.
+aesonCodec
+  :: (Monad em, Monad dm, Aeson.ToJSON x, Aeson.FromJSON x)
+  => Codec em dm x
+aesonCodec = Codec
+  { encode = Pipes.Aeson.Unchecked.encode
+  , decode = fmap (join . fmap (either (const Nothing) Just))
+                  Pipes.Aeson.Unchecked.decode
+  }
+
+--------------------------------------------------------------------------------
+
+newtype RecoveryDataId = RecoveryDataId Int64
+  deriving (Eq, Show, Ord)
+
+data RecoveryDataStore m = RecoveryDataStore
+  { recoveryDataStorePut
+      :: Pipes.Producer BS.ByteString m ()
+      -> m RecoveryDataId
+  , recoveryDataStoreGet
+      :: RecoveryDataId
+      -> m (Maybe (Pipes.Producer BS.ByteString m ()))
+  , recoveryDataStoreDelete
+      :: RecoveryDataId
+      -> m ()  -- ^ Doesn't fail if 'RecoveryDataId' is absent.
+  }
+
+-- | Internal
+recoveryDataStoreEncode
+  :: RecoveryDataStore IO
+  -> Codec IO IO a
+  -> a
+  -> IO RecoveryDataId
+recoveryDataStoreEncode rds c a =
+  recoveryDataStorePut rds (encode c a)
+
+-- | Internal
+recoveryDataStoreDecode
+  :: RecoveryDataStore IO
+  -> Codec IO IO a
+  -> RecoveryDataId
+  -> IO a
+recoveryDataStoreDecode rds c rdId = do
+   recoveryDataStoreGet rds rdId >>= \case
+      Nothing  -> Ex.throwIO (Err_RecoveryDataMissing rdId)
+      Just pbs -> evalStateT (decode c) pbs >>= \case
+         Nothing -> Ex.throwIO (Err_RecoveryDataMalformed rdId)
+         Just a  -> pure a
+
+--------------------------------------------------------------------------------
+
 -- | A single real-world side-effecting step in a migration with direction @d@.
 data Step (d :: Direction) env = forall pre pos. Step
-  { step :: env -> IO (pre, IO pos)
+  { stepRecon :: env -> Recon pre pos
     -- ^ Migrate in direction @d@.
     --
-    -- If @'IO' pos@ fails, then 'stepRecover' will be called.
+    -- If the 'Alter' inside the 'Recon' fails, then 'stepRecover' will be
+    -- executed.
     --
-    -- If @'IO' pos@ succeeds, but a latter migration intended to be executed
-    -- atomically with this fails, then 'stepRollback' will be called.
+    -- If the 'Alter' inside the 'Recon' succeeds, but a latter migration
+    -- intended to be executed atomically together with this 'Step' fails, then
+    -- 'stepRollback' will be called.
   , stepRecover :: env -> pre -> IO ()
-    -- ^ See 'step'
+    -- ^ See 'step'.
   , stepRollback :: env -> pre -> pos -> IO ()
+    -- ^ See 'step'.
+  , stepCodecPre :: forall em dm. (Monad em, Monad dm) => Codec em dm pre
+    -- ^ Witness the fact that @pre@ can be serialized for later recovery.
+  , stepCodecPos :: forall em dm. (Monad em, Monad dm) => Codec em dm pos
+    -- ^ Witness the fact that @pos@ can be serialized for later recovery.
   }
 
 -- | A 'Step' that doesn't do any recovery nor rollback.
@@ -154,7 +265,12 @@ naiveStep
   :: (env -> IO ())   -- ^ Migrate in direction @d@.
   -> Step d env
 naiveStep f = Step
-  (\env -> pure ((), f env)) (\_ _ -> pure ()) (\_ _ _ -> pure ())
+  { stepRecon = \env -> Recon (pure ((), Alter (f env)))
+  , stepRecover = \_ () -> pure ()
+  , stepRollback = \_ () () -> pure ()
+  , stepCodecPre = aesonCodec
+  , stepCodecPos = aesonCodec
+  }
 
 --------------------------------------------------------------------------------
 
@@ -206,7 +322,7 @@ withLoggedMigration
   -> Direction         -- ^ Direction on which the migration is being applied
   -> MigId             -- ^ Identifier for the migration being applied
   -> T.Text            -- ^ Description of the migration being applied
-  -> IO Undo           -- ^ Action that performs the migration in the       desired
+  -> IO Undo           -- ^ Action that performs the migration in the desired
                        --   direction and returns a rollback action in the
                        --   opposite direction, which will be used in case it is
                        --   not possible to sucessfully record the migration
@@ -218,8 +334,11 @@ withLoggedMigration
 withLoggedMigration migsdb say0 d0 migId' migDesc' m = do
     mDone <- migsdbGet migsdb migId'
     case (d0, mDone) of
-      (Backwards, Nothing) -> skip
-      (Forwards,  Just _)  -> skip
+      (Backwards, Nothing) -> do
+         pure mempty
+      (Forwards,  Just _)  -> do
+         say d0 "SKIPPING: already done"
+         pure mempty
       _ -> do
          say d0 "START"
          undo <- Ex.catch m $ \(e :: Ex.SomeException) -> do
@@ -241,9 +360,6 @@ withLoggedMigration migsdb say0 d0 migId' migDesc' m = do
     say d x = do
       let prefix = direction "<- BCK " "-> FWD " d
       say0 (prefix <> show migId' <> " - " <> x)
-
-    skip :: IO Undo
-    skip = say d0 "SKIPPING: already done" >> pure mempty
 
     logMig :: Direction -> IO ()
     logMig Backwards = migsdbDel migsdb migId'
@@ -271,60 +387,75 @@ targetMigration mId xs =
 -- Running migrations
 
 run
-  :: MigsDb            -- ^ Where to keep track of applied migrations.
-  -> (String -> IO ()) -- ^ Used to report textual progress.
-  -> Target a env      -- ^ Target migration.
-  -> StepRunner a env  -- ^ How to run each migration step.
+  :: MigsDb                -- ^ Where to keep track of applied migrations.
+  -> RecoveryDataStore IO  -- ^ Store where recovery data is kept.
+  -> (String -> IO ())     -- ^ Used to report textual progress.
+  -> Target a env          -- ^ Target migration.
+  -> StepRunner a env      -- ^ How to run each migration step.
   -> IO ()
-run migsdb say t runner = do
+run migsdb rds say t runner = do
   withMigsDbLock migsdb $ do
      yp <- mkPlan migsdb t
      case yp of
         Nothing -> say "Nothing to do. Bye."
         Just (UnsafePlan d0 migs) -> do
-           traverse_ (run' migsdb say runner d0) migs
+           traverse_ (run' migsdb rds say runner d0) migs
 
 -- | Internal
 run' :: MigsDb
+     -> RecoveryDataStore IO
      -> (String -> IO ())
      -> StepRunner a env
      -> Direction
      -> Mig a env
      -> IO Undo
-run' migsdb say runner d0 (Mig migId' migDesc migMigIns) = do
-    let withLoggedMigration' = withLoggedMigration migsdb say
-    withLoggedMigration' d0 migId' migDesc $ case migMigIns of
-       MigrateMany migs -> foldlM
-          (\undo x -> do
-              undo' <- Ex.onException
-                 (run' migsdb say runner d0 x)
-                 (runUndo undo)
-              pure (undo' <> undo))
-          (mempty :: Undo)
-          (direction reverse id d0 migs)
-       MigrateOne a (Step f frec frol) ystepb -> case d0 of
-          Forwards -> do
-             (pre, mpos) <- runner a f
-             let bwd = \ypos -> join $ fmap runUndo $ do
-                    withLoggedMigration' Backwards migId' migDesc $ do
-                       runner a $ \env -> case ypos of
-                          Nothing  -> frec env pre
-                          Just pos -> frol env pre pos
-                       pure mempty
-             pos <- Ex.onException mpos (bwd Nothing)
-             pure (Undo (bwd (Just pos)))
-          Backwards -> case ystepb of
-             Nothing -> Ex.throwIO (Err_UnsuportedMigBackwards migId')
-             Just (Step b brec brol) -> do
-                (pre, mpos) <- runner a b
-                let fwd = \ypos -> join $ fmap runUndo $ do
-                       withLoggedMigration' Forwards migId' migDesc $ do
-                          runner a $ \env -> case ypos of
-                             Nothing  -> brec env pre
-                             Just pos -> brol env pre pos
-                          pure mempty
-                pos <- Ex.onException mpos (fwd Nothing)
-                pure (Undo (fwd (Just pos)))
+run' migsdb rds say runner d0 (Mig migId' migDesc migMigIns) = do
+  let withLoggedMigration' = withLoggedMigration migsdb say
+  withLoggedMigration' d0 migId' migDesc $ case migMigIns of
+    MigrateMany migs -> foldlM
+      (\undo x -> do
+          undo' <- Ex.onException
+             (run' migsdb rds say runner d0 x)
+             (runUndo undo)
+          pure (undo' <> undo))
+      (mempty :: Undo)
+      (direction reverse id d0 migs)
+    MigrateOne a (Step f frec frol fcpre fcpos) ystepb -> case d0 of
+      Forwards -> do
+        (pre, mpos) <- runner a (runRecon . f)
+        rdIdpre <- recoveryDataStoreEncode rds fcpre pre
+        let bwd = \yrdIdpos -> join $ fmap runUndo $ do
+              withLoggedMigration' Backwards migId' migDesc $ do
+                runner a $ \env -> do
+                  pre' <- recoveryDataStoreDecode rds fcpre rdIdpre
+                  case yrdIdpos of
+                    Nothing -> frec env pre'
+                    Just rdIdPos -> do
+                      pos' <- recoveryDataStoreDecode rds fcpos rdIdPos
+                      frol env pre' pos'
+                pure mempty
+        pos <- Ex.onException (runAlter mpos) (bwd Nothing)
+        rdIdpos <- recoveryDataStoreEncode rds fcpos pos
+        pure (Undo (bwd (Just rdIdpos)))
+
+      Backwards -> case ystepb of
+        Nothing -> Ex.throwIO (Err_UnsupportedMigBackwards migId')
+        Just (Step b brec brol bcpre bcpos) -> do
+          (pre, mpos) <- runner a (runRecon . b)
+          rdIdpre <- recoveryDataStoreEncode rds bcpre pre
+          let fwd = \yrdIdpos -> join $ fmap runUndo $ do
+                withLoggedMigration' Forwards migId' migDesc $ do
+                  runner a $ \env -> do
+                    pre' <- recoveryDataStoreDecode rds bcpre rdIdpre
+                    case yrdIdpos of
+                      Nothing -> brec env pre'
+                      Just rdIdPos -> do
+                        pos' <- recoveryDataStoreDecode rds bcpos rdIdPos
+                        brol env pre' pos'
+                  pure mempty
+          pos <- Ex.onException (runAlter mpos) (fwd Nothing)
+          rdIdpos <- recoveryDataStoreEncode rds bcpos pos
+          pure (Undo (fwd (Just rdIdpos)))
 
 --------------------------------------------------------------------------------
 
@@ -366,9 +497,17 @@ data Err_Locked = Err_Locked
   deriving (Eq, Ord, Show)
 instance Ex.Exception Err_Locked
 
-data Err_UnsuportedMigBackwards = Err_UnsuportedMigBackwards !MigId
+data Err_UnsupportedMigBackwards = Err_UnsupportedMigBackwards !MigId
   deriving (Eq, Ord, Show)
-instance Ex.Exception Err_UnsuportedMigBackwards
+instance Ex.Exception Err_UnsupportedMigBackwards
+
+data Err_RecoveryDataMissing = Err_RecoveryDataMissing !RecoveryDataId
+  deriving (Eq, Ord, Show)
+instance Ex.Exception Err_RecoveryDataMissing
+
+data Err_RecoveryDataMalformed = Err_RecoveryDataMalformed !RecoveryDataId
+  deriving (Eq, Ord, Show)
+instance Ex.Exception Err_RecoveryDataMalformed
 
 --------------------------------------------------------------------------------
 

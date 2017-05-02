@@ -32,12 +32,15 @@ tt =
   Tasty.testGroup "main"
   [ Tasty.testCase "naive" $ do
       migsdb <- InMemory.mkMigsDb putStrLn
+      rds <- InMemory.mkRecoveryDataStore putStrLn
       let Just t = Umzug.targetForwards
             [ migOne_M1_blank
             , migMany_empty
             , migMany_blank
+            , migOne_M1_recover
             ]
-      run migsdb putStrLn t srm
+      expectErr "migOne_M1_recover.step.mpos" $ do
+        run migsdb rds putStrLn t srm
       mIds <- migsdbIds migsdb
       Tasty.assertEqual ""
         [ "migOne_M1_blank"
@@ -69,9 +72,11 @@ migOne_M1_blank = mig "migOne_M1_blank" "" M1
 
 migOne_M1_recover :: Mig M Env
 migOne_M1_recover = mig "migOne_M1_recover" "" M1
-  (Step (\Env -> pure (True, err "migOne_M1_recover.step.mpos"))
-        (\Env True -> pure ())
-        (\Env True () -> err "migOne_M1_recover.stepRecover.unreachable"))
+  (Step (\Env -> Recon (pure ((), Alter (err "migOne_M1_recover.step.mpos"))))
+        (\Env () -> pure ())
+        (\Env () () -> err "migOne_M1_recover.stepRecover.unreachable")
+        aesonCodec
+        aesonCodec)
   Nothing
 
 srm :: StepRunner M Env

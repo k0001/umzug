@@ -1,11 +1,18 @@
-module Data.Umzug.InMemory (mkMigsDb) where
+{-# LANGUAGE BangPatterns #-}
+
+module Data.Umzug.InMemory
+  ( mkMigsDb
+  , mkRecoveryDataStore
+  ) where
 
 import Control.Concurrent.MVar
-  (readMVar, newMVar, takeMVar, modifyMVar_, tryPutMVar)
+  (readMVar, newMVar, takeMVar, modifyMVar, modifyMVar_, tryPutMVar)
 import Control.Monad (void)
 import Data.List as List
 import Data.Text (Text)
 import Data.Time (UTCTime, getCurrentTime)
+import qualified Pipes
+import qualified Pipes.Prelude as Pipes
 
 import Data.Umzug.Core
 
@@ -44,3 +51,26 @@ mkMigsDb say = do
         void $ tryPutMVar mvLock ()
     }
 
+--------------------------------------------------------------------------------
+
+mkRecoveryDataStore
+  :: (String -> IO ())   -- ^ Logging function.
+  -> IO (RecoveryDataStore IO)
+mkRecoveryDataStore say = do
+   mvNextId <- newMVar minBound
+   mvStore <- newMVar []
+   pure $ RecoveryDataStore
+     { recoveryDataStorePut = \pbs -> do
+         id' <- modifyMVar mvNextId (\id' -> pure (id' + 1, id'))
+         say ("recoveryDataStorePut " ++ show id')
+         !bs <- mconcat <$> Pipes.toListM pbs
+         modifyMVar_ mvStore (pure . ((id',bs):))
+         pure (RecoveryDataId id')
+     , recoveryDataStoreGet = \(RecoveryDataId id') -> do
+         say ("recoveryDataStoreGet " ++ show id')
+         ybs <- List.lookup id' <$> readMVar mvStore
+         pure (fmap Pipes.yield ybs)
+     , recoveryDataStoreDelete = \(RecoveryDataId id') -> do
+         say ("recoveryDataStoreDelete " ++ show id')
+         modifyMVar_ mvStore (pure . filter ((/=) id' . fst))
+     }
