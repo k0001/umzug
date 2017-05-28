@@ -122,8 +122,8 @@ mkUndoDataStore' di0 sn0 tnUds0 c = do
         \, UNIQUE (mig_id, typ) )"
       (sn, tnUds)
    let udsKey :: UndoDataId -> (MigId, String)
-       udsKey = \case UndoDataRecoveryId mId -> (mId, "pre")
-                      UndoDataRollbackId mId -> (mId, "pos")
+       udsKey = \case UndoDataPreId mId -> (mId, "pre")
+                      UndoDataPosId mId -> (mId, "pos")
    pure $ UndoDataStore
      { udsPut = \udId pbs -> do
          dbg di1 ("udsPut " ++ show udId)

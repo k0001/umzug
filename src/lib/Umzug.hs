@@ -198,8 +198,8 @@ aesonCodec = Codec
 --------------------------------------------------------------------------------
 
 data UndoDataId
-  = UndoDataRecoveryId !MigId
-  | UndoDataRollbackId !MigId
+  = UndoDataPreId !MigId
+  | UndoDataPosId !MigId
   deriving (Eq, Show, Ord)
 
 data UndoDataStore m = UndoDataStore
@@ -387,23 +387,23 @@ run' di0 migsdb uds runner d0 (Mig mId migMigIns) = do
       inf di1 "Running Recon"
       (pre, mpos) <- runner a (runRecon . h)
       inf di1 "Saving recovery data"
-      udsEncode uds hcpre (UndoDataRecoveryId mId) pre
+      udsEncode uds hcpre (UndoDataPreId mId) pre
       let undo :: Maybe (Maybe pos) -> Undo
           undo = \yypos -> Undo $ join $ fmap runUndo $ runner a $ \env -> do
-            pre' <- udsDecode uds hcpre (UndoDataRecoveryId mId)
+            pre' <- udsDecode uds hcpre (UndoDataPreId mId)
             case yypos of
-              Nothing -> hrec env pre'   -- recovery
-              Just ypos -> do            -- rollback
+              Nothing -> hrec env pre'   -- cleanup pre
+              Just ypos -> do            -- clenaup pos
                 hrol env pre' =<< case ypos of
                   Just pos -> pure pos
-                  Nothing -> udsDecode uds hcpos (UndoDataRollbackId mId)
+                  Nothing -> udsDecode uds hcpos (UndoDataPosId mId)
                 recMig (directionOpposite d0)
             pure mempty
       inf di1 "Running Alter"
       pos <- Ex.onException (runAlter mpos) (runUndo (undo Nothing))
       Ex.onException (recMig d0) (runUndo (undo (Just (Just pos))))
       inf di1 "Saving rollback data"
-      udsEncode uds hcpos (UndoDataRollbackId mId) pos
+      udsEncode uds hcpos (UndoDataPosId mId) pos
       pure (undo (Just Nothing))
 
 --------------------------------------------------------------------------------
