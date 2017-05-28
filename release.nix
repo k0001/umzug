@@ -7,10 +7,17 @@
 }:
 
 let
-
 pkgs = import nixpkgs {};
+di-src = pkgs.fetchFromGitHub {
+  owner = "k0001";
+  repo = "di";
+  rev = "f93350f157e0b317f133842c3e9050d9c1461fb4";
+  sha256 = "0dfx249x0c7py91bi5wb23qqpgqxkpn30a3n0skgz0y03slrxk5r";
+};
 
 hsPackageSetConfig = self: super: {
+  di = self.callPackage "${di-src}/pkg.nix" {};
+  ex-pool = pkgs.haskell.lib.doJailbreak super.ex-pool;
   umzug = self.callPackage (import ./pkg.nix) {};
 };
 
