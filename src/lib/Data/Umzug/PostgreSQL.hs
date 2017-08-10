@@ -40,7 +40,7 @@ mkMigsDbInPostgreSQL tableName0 c = do
           when (n1 /= 1) $ error "mkMigsDbInPostgreSQLTable.migsdbDel"
 
       , migsdbAll = do
-          PG.query c "SELECT (id,descr,ts) FROM ? ORDER BY ts ASC"
+          PG.query c "SELECT id, descr, ts FROM ? ORDER BY ts ASC"
                      (PG.Only tableName)
 
       , migsdbGet = \migId' -> do
