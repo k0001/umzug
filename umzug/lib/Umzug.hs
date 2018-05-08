@@ -392,12 +392,14 @@ run' migsDb uds env d0 (Mig mId migMigIns) =
       Di.attr "mig" (migId_df1Value mId) $ do
          Di.notice "Running..."
          direction (work sb) (work sf) d0 <* Di.info "Ran."
+    MigrateMany [] -> pure mempty
     MigrateMany migs ->
       -- We run many single migrations in direction @d0@
       Di.push "many" $
       Di.attr "dir" (direction_df1Value d0) $
       Di.attr "mig" (migId_df1Value mId) $ do
-         Di.notice "Running..."
+         Di.notice (fromString ("Running group of " ++ show (length migs) ++
+                                " migrations atomically..."))
          undo <- foldlM
            (\undo x -> do
                undo' <- Ex.onException (run' migsDb uds env d0 x) (runUndo undo)
