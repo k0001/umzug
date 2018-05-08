@@ -56,7 +56,7 @@ module Umzug
  ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (join, unless)
+import Control.Monad (unless)
 import qualified Control.Monad.Catch as Ex
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Strict (evalStateT)
@@ -165,14 +165,9 @@ data Migrate (m :: * -> *) (a :: *) (env :: *)
 -- can be inserted back if necessary, as part of a recovery or rollback process.
 newtype Recon m pre pos = Recon (m (pre, Alter m pos))
 
-runRecon
-  :: Di.MonadDf1 m
-  => Recon m pre pos
-  -> m (pre, Alter m pos)
-runRecon (Recon m) = do
-  Di.push "recon" $ do
-    Di.debug "Running"
-    m
+runRecon :: Di.MonadDf1 m => Recon m pre pos -> m (pre, Alter m pos)
+runRecon (Recon m) = Di.push "recon" $ do
+   Di.debug "Running..." *> m <* Di.debug "Ran."
 
 -- | Wraper around an 'IO' action intended to do any altering or destructive
 -- side-effect as part of a 'Step'.
@@ -184,14 +179,10 @@ runRecon (Recon m) = do
 -- recovery process.
 newtype Alter m pos = Alter (m pos)
 
-runAlter
-  :: Di.MonadDf1 m
-  => Alter m pos
-  -> m pos
-runAlter (Alter m) = do
-  Di.push "alter" $ do
-    Di.debug "Running"
-    m
+runAlter :: Di.MonadDf1 m => Alter m pos -> m pos
+runAlter (Alter m) = Di.push "alter" $ do
+  Di.debug "Running..." *> m <* Di.debug "Ran."
+
 --------------------------------------------------------------------------------
 
 -- | Witness that @a@ can be encoded and decoded as a 'B.ByteString'.
@@ -229,31 +220,47 @@ data UndoDataStore m = UndoDataStore
   }
 
 -- | Internal
-udsEncode
-  :: Di.MonadDf1 m
+udsSave
+  :: forall m a
+  .  Di.MonadDf1 m
   => UndoDataStore m
   -> Codec m m a
   -> UndoDataId
   -> a
   -> m ()
-udsEncode uds c udId a =
-  Di.push "uds-encode" $ do
-     undoDataStore_put uds udId (encode c a)
+udsSave uds c udId a = k $ do
+    Di.debug "Saving..."
+    undoDataStore_put uds udId (encode c a)
+    Di.info "Saved."
+  where
+    k :: forall x. m x -> m x
+    k = case udId of
+      UndoDataPreId{} -> Di.push "save-recovery"
+      UndoDataPosId{} -> Di.push "save-rollback"
 
 -- | Internal
-udsDecode
-  :: (Di.MonadDf1 m, Ex.MonadThrow m)
+udsLoad
+  :: forall m a
+  .  (Di.MonadDf1 m, Ex.MonadThrow m)
   => UndoDataStore m
   -> Codec m m a
   -> UndoDataId
   -> m a
-udsDecode uds c udId = do
-  Di.push "uds-decode" $ do
-     undoDataStore_get uds udId >>= \case
+udsLoad uds c udId = k $ do
+    Di.debug "Loading..."
+    a <- undoDataStore_get uds udId >>= \case
         Nothing  -> Ex.throwM (Err_UndoDataMissing udId)
         Just pbs -> evalStateT (decode c) pbs >>= \case
            Nothing -> Ex.throwM (Err_UndoDataMalformed udId)
            Just a  -> pure a
+    Di.info "Loaded."
+    pure a
+  where
+    k :: forall x. m x -> m x
+    k = case udId of
+      UndoDataPreId{} -> Di.push "load-recovery"
+      UndoDataPosId{} -> Di.push "load-rollback"
+
 
 --------------------------------------------------------------------------------
 
@@ -288,11 +295,9 @@ runStepRunner
   => StepRunner m a env
   -> a
   -> (env -> m x)
-  -> m x
-runStepRunner (StepRunner f) a g =
-  Di.push "step-runner" $ do
-     Di.debug "Running"
-     f g a
+  -> m x -- ^
+runStepRunner (StepRunner f) a g = Di.push "step-runner" $ do
+  Di.debug "Running..." *> f g a <* Di.debug "Ran."
 
 --------------------------------------------------------------------------------
 
@@ -335,7 +340,11 @@ migsDb_ids = fmap (map fst) . migsDb_all
 
 -- | A simple wrapper around @m ()@, mostly for avoid accidentally confusing
 -- this 'm' action with others.
-newtype Undo m = Undo { runUndo :: m () }
+newtype Undo m = Undo (m ())
+
+runUndo :: Di.MonadDf1 m => Undo m -> m ()
+runUndo (Undo m) = Di.push "undo" $ do
+  Di.debug "Running..." *> m <* Di.debug "Ran."
 
 instance Monad m => Semigroup (Undo m) where
   -- | @a <> b@ runs @a@ first, then @b@.
@@ -395,24 +404,28 @@ run'
 run' migsDb uds sr d0 (Mig mId migMigIns) =
   case migMigIns of
     MigrateOne a sf sb ->
+      -- We run one single migration in direction @d0@
       Di.push "one" $
       Di.attr "dir" (direction_df1Value d0) $
-      Di.attr "mig" (migId_df1Value mId) $
-        direction (work a sb) (work a sf) d0
+      Di.attr "mig" (migId_df1Value mId) $ do
+         Di.notice "Running..."
+         direction (work a sb) (work a sf) d0 <* Di.info "Ran."
     MigrateMany migs ->
+      -- We run many single migrations in direction @d0@
       Di.push "many" $
       Di.attr "dir" (direction_df1Value d0) $
       Di.attr "mig" (migId_df1Value mId) $ do
-        undo <- foldlM
-          (\undo x -> do
-              undo' <- Ex.onException
-                 (run' migsDb uds sr d0 x)
-                 (runUndo undo)
-              pure (undo' <> undo))
-          (mempty :: Undo m)
-          (direction reverse id d0 migs)
-        Ex.onException (recMig d0) (runUndo undo)
-        pure (Undo (recMig (directionOpposite d0) >> runUndo undo))
+         Di.notice "Running..."
+         undo <- foldlM
+           (\undo x -> do
+               undo' <- Ex.onException (run' migsDb uds sr d0 x) (runUndo undo)
+               pure (undo' <> undo))
+           (mempty :: Undo m)
+           (direction reverse id d0 migs)
+         Ex.onException (recMig d0) (runUndo undo)
+         Di.info "Ran."
+         pure (Undo (recMig (directionOpposite d0) >> runUndo undo))
+
   where
     recMig :: Direction -> m ()
     recMig = \case
@@ -422,30 +435,28 @@ run' migsDb uds sr d0 (Mig mId migMigIns) =
     work :: a -> Step m d env -> m (Undo m)
     work a (Step h hrec (hrol :: env -> pre -> pos -> m ()) hcpre hcpos) = do
       (pre, mpos) <- runStepRunner sr a (runRecon . h)
-      Di.debug "Saving recovery data"
-      udsEncode uds hcpre (UndoDataPreId mId) pre
+      udsSave uds hcpre (UndoDataPreId mId) pre
       let undo :: Maybe (Maybe pos) -> Undo m
-          undo = \yypos -> Undo $ Di.push "undo" $ join $ fmap runUndo $ do
+          undo = \yypos -> Undo $ do
             runStepRunner sr a $ \env -> do
-              pre' <- udsDecode uds hcpre (UndoDataPreId mId)
+              pre' <- udsLoad uds hcpre (UndoDataPreId mId)
               case yypos of
                 Nothing -> Di.push "recover" $ do
-                  Di.warning "Running"
-                  hrec env pre'
+                  Di.warning "Running..."
+                  hrec env pre' <* Di.notice "Ran."
                 Just ypos -> Di.push "rollback" $ do
-                  Di.warning "Running"
+                  Di.warning "Running..."
                   hrol env pre' =<< case ypos of
                     Just pos -> pure pos
-                    Nothing -> udsDecode uds hcpos (UndoDataPosId mId)
-                  recMig (directionOpposite d0)
+                    Nothing -> udsLoad uds hcpos (UndoDataPosId mId)
+                  recMig (directionOpposite d0) <* Di.notice "Ran."
               pure mempty
       pos <- Ex.onException (runAlter mpos) (runUndo (undo Nothing))
       Ex.catch (recMig d0) $ \(se :: Ex.SomeException) -> do
          Di.attr "exception" (fromString (show se)) $ do
             Di.error "Shit hit the fan. Will undo now."
          Ex.finally (runUndo (undo (Just (Just pos)))) (Ex.throwM se)
-      Di.debug "Saving rollback data"
-      udsEncode uds hcpos (UndoDataPosId mId) pos
+      udsSave uds hcpos (UndoDataPosId mId) pos
       pure (undo (Just Nothing))
 
 --------------------------------------------------------------------------------
