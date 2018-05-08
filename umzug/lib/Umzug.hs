@@ -1,9 +1,12 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -18,14 +21,14 @@ module Umzug
    -- * Keeping track of ran migrations
 
  , MigsDb(..)
- , migsdbIds
+ , migsDb_ids
 
    -- * Types
 
  , MigId(..)
 
  , Mig(..)
- , migIds
+ , mig_ids
 
  , Direction(..)
  , direction
@@ -34,14 +37,12 @@ module Umzug
  , Migrate(..)
 
  , Step(..)
- , naiveStep
- , StepRunner
+ , StepRunner(..)
 
  , Recon(..)
  , Alter(..)
 
  , Codec(..)
- , aesonCodec
 
  , UndoDataId(..)
  , UndoDataStore(..)
@@ -55,46 +56,49 @@ module Umzug
  ) where
 
 import Control.Concurrent (threadDelay)
-import qualified Control.Exception as Ex
-import Control.Monad
-import Control.Monad.Trans.State.Strict (evalStateT)
-import Di (Di, inf, wrn)
+import Control.Monad (join, unless)
+import qualified Control.Monad.Catch as Ex
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.State.Strict (evalStateT)
 import qualified Di
-import qualified Data.Aeson as Aeson
-import qualified Data.ByteString as BS
-import Data.Foldable
+import qualified Data.ByteString as B
+import Data.Foldable (foldlM, traverse_)
 import qualified Data.List as List
-import Data.Monoid
-import Data.String (IsString)
-import Data.Text (Text)
+import Data.String (IsString, fromString)
+import qualified Data.Text.Lazy as TL
 import Data.Time (UTCTime)
 import qualified Pipes
 import qualified Pipes.Parse as Pipes
-import qualified Pipes.Aeson.Unchecked
 
 --------------------------------------------------------------------------------
 
-data Direction = Backwards | Forwards
-  deriving (Eq, Show, Read, Ord)
+data Direction
+  = Backwards
+  | Forwards
+  deriving stock (Eq, Show, Ord)
 
 -- | Case analysis for 'Direction'. Evaluate to the first @a@ in case it is
 -- 'Backwards', otherwise to the second @a@.
 direction :: a -> a -> Direction -> a
-direction a _ Backwards = a
-direction _ a Forwards  = a
+direction bw fw = \case
+  Backwards -> bw
+  Forwards -> fw
 
 directionOpposite :: Direction -> Direction
 directionOpposite = direction Forwards Backwards
+
+direction_df1Value :: Direction -> Di.Value
+direction_df1Value = direction "backwards" "forwards"
 
 --------------------------------------------------------------------------------
 
 -- | Unique identifier for a 'Mig' (unique within the closed word of 'Mig's you
 -- want to deal with, that is).
-newtype MigId = MigId Text
-  deriving (Eq, Ord, IsString)
+newtype MigId = MigId TL.Text
+  deriving newtype (Eq, Show, Ord, IsString)
 
-instance Show MigId where
-  show (MigId x) = show x
+migId_df1Value :: MigId -> Di.Value
+migId_df1Value (MigId x) = Di.value x
 
 --------------------------------------------------------------------------------
 
@@ -102,17 +106,17 @@ instance Show MigId where
 -- to the environment @env@.
 --
 -- Hint: use 'mig' and 'migMany' to construct 'Mig's.
-data Mig a env = Mig
-  { migId           :: !MigId      -- ^ Unique identifier.
-  , migInstructions :: !(Migrate a env)
+data Mig m a env = Mig
+  { mig_id :: !MigId      -- ^ Unique identifier.
+  , mig_instructions :: !(Migrate m a env)
   }
 
 -- | 'MigId's present in the given 'Mig', in the order they would be applied
 -- if ran forwards.
-migIds :: Mig a env -> [MigId]
-migIds (Mig a c) = a : case c of
-    MigrateMany migs -> migs >>= migIds
-    _ -> []
+mig_ids :: Mig m a env -> [MigId]
+mig_ids (Mig a c) = a : case c of
+  MigrateMany migs -> migs >>= mig_ids
+  _ -> []
 
 --------------------------------------------------------------------------------
 -- Smart constructors for 'Mig'
@@ -121,10 +125,10 @@ migIds (Mig a c) = a : case c of
 -- rolling back previous successes if one of the following migrations fails.
 migMany
   :: MigId  -- ^ Unique identifier.
-  -> [Mig a env]  -- ^ Migrations to apply “atomically”, listed in
-                  --   forward direction (even if you plan to apply your
-                  --   migrations backwards).
-  -> Mig a env
+  -> [Mig m a env]
+  -- ^ Migrations to apply “atomically”, listed in forward direction (even if
+  -- you plan to apply your migrations backwards).
+  -> Mig m a env
 migMany mId migs = Mig mId (MigrateMany migs)
 
 -- | Create a new 'Mig' that performs a single migration step, either in
@@ -132,20 +136,20 @@ migMany mId migs = Mig mId (MigrateMany migs)
 mig
   :: MigId  -- ^ Unique identifier.
   -> a      -- ^ Description of the migration.
-  -> Step 'Forwards env
-  -> Step 'Backwards env
-  -> Mig a env
+  -> Step m 'Forwards env
+  -> Step m 'Backwards env
+  -> Mig m a env
 mig mId a sf sb = Mig mId (MigrateOne a sf sb)
 
 --------------------------------------------------------------------------------
 
 -- | Detailed instructions on what kind of migration to perform.
-data Migrate a env
-  = -- | Apply many child migrations sequentially, rolling back previous
+data Migrate (m :: * -> *) (a :: *) (env :: *)
+  = MigrateMany ![Mig m a env]
+    -- ^ Apply many child migrations sequentially, rolling back previous
     -- successes if one of the following migrations fails.
-    MigrateMany ![Mig a env]
-  | -- | Apply a custom migration step as described by @a@.
-    MigrateOne !a !(Step 'Forwards env) !(Step 'Backwards env)
+  | MigrateOne !a !(Step m 'Forwards env) !(Step m 'Backwards env)
+    -- ^ Apply a custom migration step as described by @a@.
 
 --------------------------------------------------------------------------------
 
@@ -159,7 +163,16 @@ data Migrate a env
 -- For example, if the related 'Alter' plans to delete entries from a database,
 -- then 'Recon' should gather the entries to be deleted in @pre@, so that they
 -- can be inserted back if necessary, as part of a recovery or rollback process.
-newtype Recon pre pos = Recon { runRecon  :: IO (pre, Alter pos) }
+newtype Recon m pre pos = Recon (m (pre, Alter m pos))
+
+runRecon
+  :: Di.MonadDf1 m
+  => Recon m pre pos
+  -> m (pre, Alter m pos)
+runRecon (Recon m) = do
+  Di.push "recon" $ do
+    Di.debug "Running"
+    m
 
 -- | Wraper around an 'IO' action intended to do any altering or destructive
 -- side-effect as part of a 'Step'.
@@ -169,9 +182,19 @@ newtype Recon pre pos = Recon { runRecon  :: IO (pre, Alter pos) }
 -- enough information to allow for the rollback of the side-effects performed by
 -- this 'Alter', in case an automated rollback is necessary as part of some
 -- recovery process.
-newtype Alter pos = Alter { runAlter :: IO pos }
+newtype Alter m pos = Alter (m pos)
 
--- | Witness that @a@ can be encoded and decoded as a 'BS.ByteString'.
+runAlter
+  :: Di.MonadDf1 m
+  => Alter m pos
+  -> m pos
+runAlter (Alter m) = do
+  Di.push "alter" $ do
+    Di.debug "Running"
+    m
+--------------------------------------------------------------------------------
+
+-- | Witness that @a@ can be encoded and decoded as a 'B.ByteString'.
 --
 -- @em@ is the base 'Monad' used for encoding.
 --
@@ -181,18 +204,8 @@ newtype Alter pos = Alter { runAlter :: IO pos }
 -- 'decode' ('encode' a) == 'pure' ('Just' a)
 -- @
 data Codec em dm a = Codec
-  { encode :: a -> Pipes.Producer BS.ByteString em ()
-  , decode :: Pipes.Parser BS.ByteString dm (Maybe a)
-  }
-
--- | Serializes @x@ using its 'Aeson.ToJSON'/'Aeson.FromJSON' representation.
-aesonCodec
-  :: (Monad em, Monad dm, Aeson.ToJSON x, Aeson.FromJSON x)
-  => Codec em dm x
-aesonCodec = Codec
-  { encode = Pipes.Aeson.Unchecked.encode
-  , decode = fmap (join . fmap (either (const Nothing) Just))
-                  Pipes.Aeson.Unchecked.decode
+  { encode :: a -> Pipes.Producer B.ByteString em ()
+  , decode :: Pipes.Parser B.ByteString dm (Maybe a)
   }
 
 --------------------------------------------------------------------------------
@@ -203,221 +216,251 @@ data UndoDataId
   deriving (Eq, Show, Ord)
 
 data UndoDataStore m = UndoDataStore
-  { udsPut
+  { undoDataStore_put
       :: UndoDataId
-      -> Pipes.Producer BS.ByteString m ()
+      -> Pipes.Producer B.ByteString m ()
       -> m ()
-  , udsGet
+  , undoDataStore_get
       :: UndoDataId
-      -> m (Maybe (Pipes.Producer BS.ByteString m ()))
-  , udsDelete
+      -> m (Maybe (Pipes.Producer B.ByteString m ()))
+  , undoDataStore_delete
       :: UndoDataId
       -> m ()  -- ^ Doesn't fail if 'UndoDataId' is absent.
   }
 
 -- | Internal
 udsEncode
-  :: UndoDataStore IO
-  -> Codec IO IO a
+  :: Di.MonadDf1 m
+  => UndoDataStore m
+  -> Codec m m a
   -> UndoDataId
   -> a
-  -> IO ()
+  -> m ()
 udsEncode uds c udId a =
-  udsPut uds udId (encode c a)
+  Di.push "uds-encode" $ do
+     undoDataStore_put uds udId (encode c a)
 
 -- | Internal
 udsDecode
-  :: UndoDataStore IO
-  -> Codec IO IO a
+  :: (Di.MonadDf1 m, Ex.MonadThrow m)
+  => UndoDataStore m
+  -> Codec m m a
   -> UndoDataId
-  -> IO a
+  -> m a
 udsDecode uds c udId = do
-   udsGet uds udId >>= \case
-      Nothing  -> Ex.throwIO (Err_UndoDataMissing udId)
-      Just pbs -> evalStateT (decode c) pbs >>= \case
-         Nothing -> Ex.throwIO (Err_UndoDataMalformed udId)
-         Just a  -> pure a
+  Di.push "uds-decode" $ do
+     undoDataStore_get uds udId >>= \case
+        Nothing  -> Ex.throwM (Err_UndoDataMissing udId)
+        Just pbs -> evalStateT (decode c) pbs >>= \case
+           Nothing -> Ex.throwM (Err_UndoDataMalformed udId)
+           Just a  -> pure a
 
 --------------------------------------------------------------------------------
 
 -- | A single real-world side-effecting step in a migration with direction @d@.
-data Step (d :: Direction) env = forall pre pos. Step
-  { stepRecon :: env -> Recon pre pos
+data Step (m :: * -> *) (d :: Direction) env = forall pre pos. Step
+  { step_recon :: env -> Recon m pre pos
     -- ^ Migrate in direction @d@.
     --
-    -- If the 'Alter' inside the 'Recon' fails, then 'stepRecover' will be
+    -- If the 'Alter' inside the 'Recon' fails, then 'step_recover' will be
     -- executed.
     --
     -- If the 'Alter' inside the 'Recon' succeeds, but a latter migration
     -- intended to be executed atomically together with this 'Step' fails, then
-    -- 'stepRollback' will be called.
-  , stepRecover :: env -> pre -> IO ()
+    -- 'step_rollback' will be called.
+  , step_recover :: env -> pre -> m ()
     -- ^ See 'step'.
-  , stepRollback :: env -> pre -> pos -> IO ()
+  , step_rollback :: env -> pre -> pos -> m ()
     -- ^ See 'step'.
-  , stepCodecPre :: forall em dm. (Monad em, Monad dm) => Codec em dm pre
+  , step_codecPre :: forall em dm. (Monad em, Monad dm) => Codec em dm pre
     -- ^ Witness the fact that @pre@ can be serialized for later recovery.
-  , stepCodecPos :: forall em dm. (Monad em, Monad dm) => Codec em dm pos
+  , step_codecPos :: forall em dm. (Monad em, Monad dm) => Codec em dm pos
     -- ^ Witness the fact that @pos@ can be serialized for later recovery.
   }
 
--- | A 'Step' that doesn't do any recovery nor rollback.
-naiveStep
-  :: (env -> IO ())   -- ^ Migrate in direction @d@.
-  -> Step d env
-naiveStep f = Step
-  { stepRecon = \env -> Recon (pure ((), Alter (f env)))
-  , stepRecover = \_ () -> pure ()
-  , stepRollback = \_ () () -> pure ()
-  , stepCodecPre = aesonCodec
-  , stepCodecPos = aesonCodec
-  }
+--------------------------------------------------------------------------------
+
+newtype StepRunner m a env
+  = StepRunner (forall x. (env -> m x) -> a -> m x)
+
+runStepRunner
+  :: Di.MonadDf1 m
+  => StepRunner m a env
+  -> a
+  -> (env -> m x)
+  -> m x
+runStepRunner (StepRunner f) a g =
+  Di.push "step-runner" $ do
+     Di.debug "Running"
+     f g a
 
 --------------------------------------------------------------------------------
 
-type StepRunner a env = forall x. a -> (env -> IO x) -> IO x
-
---------------------------------------------------------------------------------
-
-data MigsDb = MigsDb
-  { migsdbAdd :: MigId -> IO ()
+data MigsDb m = MigsDb
+  { migsDb_add :: MigId -> m ()
     -- ^ Atomic.
-  , migsdbDel :: MigId -> IO ()
+  , migsDb_del :: MigId -> m ()
     -- ^ Atomic.
-  , migsdbGet :: MigId -> IO (Maybe UTCTime)
+  , migsDb_get :: MigId -> m (Maybe UTCTime)
     -- ^ Atomic.
-  , migsdbAll :: IO [(MigId, UTCTime)]
+  , migsDb_all :: m [(MigId, UTCTime)]
     -- ^ Atomic. All migrations, ordered chronologically by timestamp.
-  , migsdbLock :: IO ()
+  , migsDb_lock :: m (Either Err_Locked ())
     -- ^ Atomic.
-  , migsdbUnlock :: IO ()
+  , migsDb_unlock :: m ()
     -- ^ Atomic.
   }
 
-withMigsDbLock :: Di String String -> MigsDb -> IO a -> IO a
-withMigsDbLock di mdb =
-    Ex.bracket_ lock (migsdbUnlock mdb)
-  where
-    lock = Ex.catch (migsdbLock mdb) $ \Err_Locked -> do
-      wrn di "Umzug database is currently locked. Retrying in 10 seconds."
-      threadDelay (1000000 * 10)
-      lock
+withMigsDbLock
+  :: forall m a
+  .  (Di.MonadDf1 m, Ex.MonadMask m, MonadIO m)
+  => MigsDb m
+  -> m a
+  -> m a
+withMigsDbLock mdb =
+   Ex.bracket_ acq (migsDb_unlock mdb)
+ where
+   acq :: m ()
+   acq = migsDb_lock mdb >>= \case
+     Right () -> pure ()
+     Left Err_Locked -> do
+       Di.warning "Umzug database is currently locked. Retrying in 10 seconds."
+       liftIO (threadDelay (1000000 * 10))
+       acq
 
-migsdbIds :: MigsDb -> IO [MigId]
-migsdbIds = fmap (map fst) . migsdbAll
+migsDb_ids :: Functor m => MigsDb m -> m [MigId]
+migsDb_ids = fmap (map fst) . migsDb_all
 
 --------------------------------------------------------------------------------
 
--- | A simple wrapper around @'IO' ()@, mostly for avoid accidentally confusing
--- this 'IO' action with others.
-newtype Undo = Undo { runUndo :: IO () }
+-- | A simple wrapper around @m ()@, mostly for avoid accidentally confusing
+-- this 'm' action with others.
+newtype Undo m = Undo { runUndo :: m () }
 
-instance Monoid Undo where
+instance Monad m => Semigroup (Undo m) where
+  -- | @a <> b@ runs @a@ first, then @b@.
+  Undo a <> Undo b = Undo (a >> b)
+
+instance Monad m => Monoid (Undo m) where
   mempty = Undo (pure ())
   -- | @'mappend' a b@ runs @a@ first, then @b@.
-  mappend (Undo a) (Undo b) = Undo (a >> b)
+  mappend = (<>)
 
 --------------------------------------------------------------------------------
 
-data Target a env = UnsafeTarget [Mig a env] MigId
+data Target m a env = UnsafeTarget [Mig m a env] MigId
 
-targetForwards :: [Mig a env] -> Maybe (Target a env)
+targetForwards :: [Mig m a env] -> Maybe (Target m a env)
 targetForwards [] = Nothing
-targetForwards xs = Just (UnsafeTarget xs (migId (last xs)))
+targetForwards xs = Just (UnsafeTarget xs (mig_id (last xs)))
 
-targetBackwards :: [Mig a env] -> Maybe (Target a env)
+targetBackwards :: [Mig m a env] -> Maybe (Target m a env)
 targetBackwards [] = Nothing
-targetBackwards xs = Just (UnsafeTarget xs (migId (head xs)))
+targetBackwards xs = Just (UnsafeTarget xs (mig_id (head xs)))
 
 -- | Note: It is impossible to target a child migration inside a 'MigrateMany'
 -- (such as the childs passed to 'migMany').
-targetMigration :: MigId -> [Mig a env] -> Maybe (Target a env)
+targetMigration :: MigId -> [Mig m a env] -> Maybe (Target m a env)
 targetMigration mId xs =
-  fmap (UnsafeTarget xs . migId) (List.find ((==) mId . migId) xs)
+  fmap (UnsafeTarget xs . mig_id) (List.find ((==) mId . mig_id) xs)
 
 --------------------------------------------------------------------------------
 -- Running migrations
 
 run
-  :: Di String String
-  -> MigsDb                -- ^ Where to keep track of applied migrations.
-  -> UndoDataStore IO  -- ^ Store where recovery data is kept.
-  -> Target a env          -- ^ Target migration.
-  -> StepRunner a env      -- ^ How to run each migration step.
-  -> IO ()
-run di migsdb uds t runner = do
-  withMigsDbLock di migsdb $ do
-    yp <- mkPlan migsdb t
+  :: (Di.MonadDf1 m, Ex.MonadMask m, MonadIO m)
+  => MigsDb m              -- ^ Where to keep track of applied migrations.
+  -> UndoDataStore m       -- ^ Store where recovery data is kept.
+  -> Target m a env        -- ^ Target migration.
+  -> StepRunner m a env    -- ^ How to run each migration step.
+  -> m ()
+run migsDb uds t sr = Di.push "umzug" $ do
+  withMigsDbLock migsDb $ do
+    yp <- mkPlan migsDb t
     case yp of
-      Nothing -> inf di "Nothing to do. Bye."
+      Nothing -> Di.notice "Nothing to do. Bye."
       Just (UnsafePlan d0 migs) ->
-        traverse_ (run' di migsdb uds runner d0) migs
+        traverse_ (run' migsDb uds sr d0) migs
 
 -- | Internal
 run'
-  :: forall a env
-  .  Di String String
-  -> MigsDb
-  -> UndoDataStore IO
-  -> StepRunner a env
+  :: forall m a env
+  .  (Di.MonadDf1 m, Ex.MonadMask m)
+  => MigsDb m
+  -> UndoDataStore m
+  -> StepRunner m a env
   -> Direction
-  -> Mig a env
-  -> IO Undo
-run' di0 migsdb uds runner d0 (Mig mId migMigIns) = do
+  -> Mig m a env
+  -> m (Undo m)
+run' migsDb uds sr d0 (Mig mId migMigIns) =
   case migMigIns of
-    MigrateOne a sf sb -> direction (work a sb) (work a sf) d0
-    MigrateMany migs -> do
-      undo <- foldlM
-        (\undo x -> do
-            undo' <- Ex.onException
-               (run' di0 migsdb uds runner d0 x)
-               (runUndo undo)
-            pure (undo' <> undo))
-        (mempty :: Undo)
-        (direction reverse id d0 migs)
-      Ex.onException (recMig d0) (runUndo undo)
-      pure (Undo (recMig (directionOpposite d0) >> runUndo undo))
+    MigrateOne a sf sb ->
+      Di.push "one" $
+      Di.attr "dir" (direction_df1Value d0) $
+      Di.attr "mig" (migId_df1Value mId) $
+        direction (work a sb) (work a sf) d0
+    MigrateMany migs ->
+      Di.push "many" $
+      Di.attr "dir" (direction_df1Value d0) $
+      Di.attr "mig" (migId_df1Value mId) $ do
+        undo <- foldlM
+          (\undo x -> do
+              undo' <- Ex.onException
+                 (run' migsDb uds sr d0 x)
+                 (runUndo undo)
+              pure (undo' <> undo))
+          (mempty :: Undo m)
+          (direction reverse id d0 migs)
+        Ex.onException (recMig d0) (runUndo undo)
+        pure (Undo (recMig (directionOpposite d0) >> runUndo undo))
   where
-    recMig :: Direction -> IO ()
-    recMig d = direction migsdbDel migsdbAdd d migsdb mId
+    recMig :: Direction -> m ()
+    recMig = \case
+      Backwards -> Di.debug "Deleting migration" >> migsDb_del migsDb mId
+      Forwards -> Di.debug "Saving migration" >> migsDb_add migsDb mId
 
-    work :: a -> Step d env -> IO Undo
-    work a (Step h hrec (hrol :: env -> pre -> pos -> IO ()) hcpre hcpos) = do
-      let di1 = Di.push di0 [show mId, show d0]
-      inf di1 "Running Recon"
-      (pre, mpos) <- runner a (runRecon . h)
-      inf di1 "Saving recovery data"
+    work :: a -> Step m d env -> m (Undo m)
+    work a (Step h hrec (hrol :: env -> pre -> pos -> m ()) hcpre hcpos) = do
+      (pre, mpos) <- runStepRunner sr a (runRecon . h)
+      Di.debug "Saving recovery data"
       udsEncode uds hcpre (UndoDataPreId mId) pre
-      let undo :: Maybe (Maybe pos) -> Undo
-          undo = \yypos -> Undo $ join $ fmap runUndo $ runner a $ \env -> do
-            pre' <- udsDecode uds hcpre (UndoDataPreId mId)
-            case yypos of
-              Nothing -> hrec env pre'   -- cleanup pre
-              Just ypos -> do            -- clenaup pos
-                hrol env pre' =<< case ypos of
-                  Just pos -> pure pos
-                  Nothing -> udsDecode uds hcpos (UndoDataPosId mId)
-                recMig (directionOpposite d0)
-            pure mempty
-      inf di1 "Running Alter"
+      let undo :: Maybe (Maybe pos) -> Undo m
+          undo = \yypos -> Undo $ Di.push "undo" $ join $ fmap runUndo $ do
+            runStepRunner sr a $ \env -> do
+              pre' <- udsDecode uds hcpre (UndoDataPreId mId)
+              case yypos of
+                Nothing -> Di.push "recover" $ do
+                  Di.warning "Running"
+                  hrec env pre'
+                Just ypos -> Di.push "rollback" $ do
+                  Di.warning "Running"
+                  hrol env pre' =<< case ypos of
+                    Just pos -> pure pos
+                    Nothing -> udsDecode uds hcpos (UndoDataPosId mId)
+                  recMig (directionOpposite d0)
+              pure mempty
       pos <- Ex.onException (runAlter mpos) (runUndo (undo Nothing))
-      Ex.onException (recMig d0) (runUndo (undo (Just (Just pos))))
-      inf di1 "Saving rollback data"
+      Ex.catch (recMig d0) $ \(se :: Ex.SomeException) -> do
+         Di.attr "exception" (fromString (show se)) $ do
+            Di.error "Shit hit the fan. Will undo now."
+         Ex.finally (runUndo (undo (Just (Just pos)))) (Ex.throwM se)
+      Di.debug "Saving rollback data"
       udsEncode uds hcpos (UndoDataPosId mId) pos
       pure (undo (Just Nothing))
 
 --------------------------------------------------------------------------------
 
-data Plan a env = UnsafePlan Direction [Mig a env]
+data Plan m a env = UnsafePlan Direction [Mig m a env]
   -- ^ Migrations to be run listed in the order in which they need to be
   --   run according to 'Direction'.
 
 mkPlan
-  :: MigsDb
-  -> Target a env
-  -> IO (Maybe (Plan a env))
-mkPlan migsdb (UnsafeTarget migs mId) = do
-  let mIds = migs >>= migIds
+  :: Monad m
+  => MigsDb m
+  -> Target n a env
+  -> m (Maybe (Plan n a env))
+mkPlan migsDb (UnsafeTarget migs mId) = do
+  let mIds = migs >>= mig_ids
 
   -- check for duplicates
   let repMigs = repeatedElements mIds
@@ -425,7 +468,7 @@ mkPlan migsdb (UnsafeTarget migs mId) = do
      error ("Duplicate migration identifiers: " <> show repMigs)
 
   -- check for incompatible migs list
-  mIdsInDb <- migsdbIds migsdb
+  mIdsInDb <- migsDb_ids migsDb
   unless (List.isPrefixOf mIdsInDb mIds) $ do
      error ("The desired migrations list (" <> show mIds <> ") is not \
             \compatible with already ran migrations (" <> show mIdsInDb <> ")")
@@ -436,9 +479,9 @@ mkPlan migsdb (UnsafeTarget migs mId) = do
        | mId == mIdCurrent -> Nothing
        | elem mId (init mIdsInDb) ->
           Just $ UnsafePlan Backwards $ reverse $
-             dropUntilAfter ((==) mId . migId)
-                (dropAfter ((==) mIdCurrent . migId) migs)
-     _ -> Just $ UnsafePlan Forwards (dropAfter ((==) mId . migId) migs)
+             dropUntilAfter ((==) mId . mig_id)
+                (dropAfter ((==) mIdCurrent . mig_id) migs)
+     _ -> Just $ UnsafePlan Forwards (dropAfter ((==) mId . mig_id) migs)
 
 --------------------------------------------------------------------------------
 
@@ -486,3 +529,4 @@ dropUntilAfter f = go
   where go [] = []
         go (a:as) | f a = as
                   | otherwise = go as
+
