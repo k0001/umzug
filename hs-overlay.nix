@@ -3,7 +3,7 @@
 let
 di-src = builtins.fetchGit {
   url = "https://github.com/k0001/di";
-  rev = "5a5e96e91fe69b8b304dd8d959c9b98ad02e03ae";
+  rev = "2ceac4a8bcbce13bf02c5b3dd253f48eed2a543c";
 };
 
 in

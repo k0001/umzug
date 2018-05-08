@@ -41,39 +41,38 @@ tt di =
       migsDb <- Umzug.InMemory.mkMigsDb
       rds <- Umzug.InMemory.mkUndoDataStore
       let Just t = U.targetForwards
-            [ migOne_M1_blank
+            [ migOne_blank
             , migMany_empty
             , migMany_blank
             -- , migOne_M1_recover
             ]
       mIds <- Di.runDiT di $ do
-        U.run migsDb rds t srm
+        U.run migsDb rds t Env
         U.migsDb_ids migsDb
       Tasty.assertEqual ""
-        [ "migOne_M1_blank"
+        [ "migOne_blank"
         , "migMany_empty"
-        , "migMany_blank.M1_blank"
+        , "migMany_blank.blank"
         , "migMany_blank"
         ] mIds
   ]
 
 --------------------------------------------------------------------------------
-data M = M1 | M2
 
 data Env = Env
 
-migMany_empty :: U.Mig m M Env
+migMany_empty :: U.Mig m Env
 migMany_empty = U.migMany "migMany_empty" []
 
-migMany_blank :: Applicative m => U.Mig m M Env
+migMany_blank :: Applicative m => U.Mig m Env
 migMany_blank = U.migMany "migMany_blank"
-  [ U.mig "migMany_blank.M1_blank" M1
+  [ U.mig "migMany_blank.blank"
       (naiveStep (\Env -> pure ()))
       (naiveStep (\Env -> pure ()))
   ]
 
-migOne_M1_blank :: Applicative m => U.Mig m M Env
-migOne_M1_blank = U.mig "migOne_M1_blank" M1
+migOne_blank :: Applicative m => U.Mig m Env
+migOne_blank = U.mig "migOne_blank"
   (naiveStep (\Env -> pure ()))
   (naiveStep (\Env -> pure ()))
 
@@ -85,11 +84,6 @@ migOne_M1_blank = U.mig "migOne_M1_blank" M1
 --         aesonCodec
 --         aesonCodec)
 --   Nothing
-
-srm :: U.StepRunner m M Env
-srm = U.StepRunner $ \f -> \case
-  M1 -> f Env
-  M2 -> f Env
 
 naiveStep
   :: Applicative m
