@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE CPP                        #-}
 
 module Data.Umzug.Core
  ( -- * Running migrations
@@ -42,7 +43,9 @@ import           Control.Monad
 import           Control.Monad.Trans.Reader           (ReaderT(runReaderT))
 import           Data.Foldable
 import qualified Data.List as List
+#if !MIN_VERSION_base(4,11,0)
 import           Data.Monoid
+#endif
 import           Data.Text                            (Text)
 import qualified Data.Text                            as T
 import           Data.Time                            (UTCTime)
